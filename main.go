@@ -49,6 +49,8 @@ var (
 	serverPort string
 
 	currentState State = StateWork
+
+	cameras []CameraData
 )
 
 func haltSystem() {
@@ -199,7 +201,7 @@ func main() {
 		client.Transport = tgTransport
 	}
 
-	bot, err := tgbotapi.NewBotAPIWithClient("1228063304:AAFOILPpFHOSRpA7rRUenMwQBT9mSOoCa6w", tgbotapi.APIEndpoint, client)
+	bot, err := tgbotapi.NewBotAPIWithClient("", tgbotapi.APIEndpoint, client)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -266,7 +268,7 @@ func main() {
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 					} else {
-						cameras := getCameras()
+						cameras = getCameras()
 						message := "Список доступных камер:\n"
 
 						for i := 0; i < len(cameras); i++ {
@@ -309,7 +311,7 @@ func main() {
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 					} else {
-						cameras := getCameras()
+						cameras = getCameras()
 						message := "Список доступных камер:\n"
 
 						for i := 0; i < len(cameras); i++ {
@@ -336,8 +338,23 @@ func main() {
 					bot.Send(msg)
 					currentState = StateWork
 				} else {
+					if value, err := strconv.ParseInt(update.Message.Text, 10, 64); err == nil {
+						if value < 1 || value > int64(len(cameras)) {
+							message := "Простите, но камеры с таким номером не существует. Введите другой номер или /cancel."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateSelectCamera
+							continue
+						}
 
+						selectCamera(cameras[value].Name)
+						message := "Камера успешно выбрана."
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateWork
+					}
 				}
+
 			case StateSelectPreset:
 				if update.Message.Text == "/cancel" {
 					message := "Выбор готовой камеры отменен. Введите следующую команду."
