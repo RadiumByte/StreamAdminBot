@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"reflect"
 	"strconv"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 	"github.com/valyala/fasthttp"
@@ -34,6 +36,13 @@ type CameraData struct {
 	Type int
 }
 
+// AddCameraData discribes new camera data
+type AddCameraData struct {
+	Name string `json:"name"`
+	Type int    `json:"type"`
+	URL  string `json:"url"`
+}
+
 // SelectCameraJSON represents transport data for camera switching
 type SelectCameraJSON struct {
 	CameraName string `json:"name"`
@@ -51,20 +60,39 @@ var (
 	currentState State = StateWork
 
 	cameras []CameraData
+	presets []AddCameraData
+
+	newCamera AddCameraData
 )
 
 func haltSystem() {
 	isAwake = false
+
+	cmdKill := exec.Command("killall", "StreamServer")
+	cmdKill.Run()
+
+	cmdKill = exec.Command("killall", "/home/anton/Radium/LabYoutubeChatbot/LabYoutubeChatbot")
+	cmdKill.Run()
 }
 
 func awakeSystem() {
-	isAwake = true
+	if !isAwake {
+		client = &fasthttp.Client{}
+		request = fasthttp.AcquireRequest()
+		response = fasthttp.AcquireResponse()
+		serverPort = ":8081"
+		serverIP = "localhost"
 
-	client = &fasthttp.Client{}
-	request = fasthttp.AcquireRequest()
-	response = fasthttp.AcquireResponse()
-	serverPort = ":8081"
-	serverIP = "localhost"
+		cmdRunServer := exec.Command("/home/anton/Radium/StreamServer/StreamServer")
+		cmdRunServer.Start()
+
+		time.Sleep(5 * time.Second)
+
+		cmdRunChatbot := exec.Command("/home/anton/Radium/LabYoutubeChatbot/LabYoutubeChatbot")
+		cmdRunChatbot.Start()
+
+		isAwake = true
+	}
 }
 
 func isAdmin(id int) bool {
@@ -74,6 +102,15 @@ func isAdmin(id int) bool {
 		}
 	}
 	return false
+}
+
+func isNameUnique(name string) bool {
+	for _, item := range cameras {
+		if item.Name == name {
+			return false
+		}
+	}
+	return true
 }
 
 func helpMessage() string {
@@ -93,18 +130,37 @@ func helpMessage() string {
 	return message
 }
 
+func setupPresets() {
+	corridor := AddCameraData{
+		Name: "Коридор",
+		URL:  "rtsp://192.168.1.223:554/user=admin_password=tlJwpbo6_channel=1_stream=0.sdp?real_stream",
+		Type: 1}
+	presets = append(presets, corridor)
+
+	webcam := AddCameraData{
+		Name: "Вебка ноута",
+		URL:  "/dev/video0",
+		Type: 0}
+	presets = append(presets, webcam)
+}
+
 // getCameras receives list of all available cameras from Stream Server
-func getCameras() []CameraData {
+func getCameras() ([]CameraData, error) {
 	request.Header.SetMethod("GET")
 
 	url := "http://" + serverIP + serverPort + "/get-cameras"
 
 	request.SetRequestURI(url)
 	err := client.Do(request, response)
+	log.Printf("Status code: %d\n", response.StatusCode())
+
+	if response.StatusCode() == 204 || response.StatusCode() == 400 {
+		return nil, nil
+	}
 
 	if err != nil {
 		fmt.Println("Client: GetCameras failed to make a request.")
-		return nil
+		return nil, err
 	}
 
 	payload := response.Body()
@@ -112,7 +168,7 @@ func getCameras() []CameraData {
 
 	if err := json.Unmarshal(payload, &dataJSON); err != nil {
 		fmt.Println("Client: Server returned bad data for GetCameras")
-		return nil
+		return nil, err
 	}
 
 	var types []interface{}
@@ -129,21 +185,26 @@ func getCameras() []CameraData {
 		cameras = append(cameras, current)
 	}
 
-	return cameras
+	return cameras, nil
 }
 
 // getActive gets one active (broadcasting) camera at this moment
-func getActive() CameraData {
+func getActive() (CameraData, error) {
 	request.Header.SetMethod("GET")
 
 	url := "http://" + serverIP + serverPort + "/get-active"
 
 	request.SetRequestURI(url)
 	err := client.Do(request, response)
+	log.Printf("Status code: %d\n", response.StatusCode())
+
+	if response.StatusCode() == 204 || response.StatusCode() == 400 {
+		return CameraData{}, nil
+	}
 
 	if err != nil {
 		fmt.Println("Client: GetActive failed to make a request.")
-		return CameraData{}
+		return CameraData{}, err
 	}
 
 	payload := response.Body()
@@ -151,7 +212,7 @@ func getActive() CameraData {
 
 	if err := json.Unmarshal(payload, &dataJSON); err != nil {
 		fmt.Println("Client: Server returned bad data for GetActive")
-		return CameraData{}
+		return CameraData{}, err
 	}
 
 	typeCam := int(dataJSON["type"].(float64))
@@ -159,11 +220,31 @@ func getActive() CameraData {
 
 	return CameraData{
 		Name: nameCam,
-		Type: typeCam}
+		Type: typeCam}, nil
+}
+
+func addCamera(data AddCameraData) error {
+	request.Header.SetMethod("POST")
+	request.Header.SetContentType("application/json")
+
+	url := "http://" + serverIP + serverPort + "/add-camera"
+	request.SetRequestURI(url)
+
+	payload, _ := json.Marshal(data)
+
+	request.SetBody(payload)
+
+	err := client.Do(request, response)
+	log.Printf("Status code: %d\n", response.StatusCode())
+
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // selectCamera makes specified camera active, switching the broadcast
-func selectCamera(name string) {
+func selectCamera(name string) error {
 	request.Header.SetMethod("POST")
 	request.Header.SetContentType("application/json")
 
@@ -177,10 +258,19 @@ func selectCamera(name string) {
 
 	request.SetBody(payload)
 
-	client.Do(request, response)
+	err := client.Do(request, response)
+	log.Printf("Status code: %d\n", response.StatusCode())
+
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func main() {
+	newCamera = AddCameraData{}
+	setupPresets()
+
 	socks5 := os.Getenv("SOCKS5_PROXY")
 	client := &http.Client{}
 
@@ -222,6 +312,7 @@ func main() {
 
 		if reflect.TypeOf(update.Message.Text).Kind() == reflect.String && update.Message.Text != "" {
 			log.Printf("[%d] %s", update.Message.From.ID, update.Message.Text)
+			log.Printf("Current state: %d", int(currentState))
 
 			if !isAdmin(update.Message.From.ID) {
 				log.Println("Unauthorized connection to the chatbot")
@@ -249,6 +340,7 @@ func main() {
 					currentState = StateWork
 
 				case "/awake":
+					awakeSystem()
 					message := "Система запущена."
 
 					msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
@@ -256,6 +348,7 @@ func main() {
 					currentState = StateWork
 
 				case "/halt":
+					haltSystem()
 					message := "Система остановлена."
 
 					msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
@@ -268,18 +361,34 @@ func main() {
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 					} else {
-						cameras = getCameras()
-						message := "Список доступных камер:\n"
-
-						for i := 0; i < len(cameras); i++ {
-							data := strconv.Itoa(i+1) + ") " + cameras[i].Name + " ("
-							if cameras[i].Type == 1 {
-								message += "RTSP)"
-							} else {
-								message += "Webcam)"
-							}
-							message += data + "\n"
+						var err error
+						cameras, err = getCameras()
+						if err != nil {
+							message := "Сервер не отвечает, проверьте его состояние."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateWork
+							continue
 						}
+
+						message := ""
+
+						if len(cameras) != 0 {
+							message = "Список доступных камер:\n"
+							for i := 0; i < len(cameras); i++ {
+								data := strconv.Itoa(i+1) + ") " + cameras[i].Name + " ("
+								if cameras[i].Type == 1 || cameras[i].Type == 2 {
+									data += "RTSP)"
+								} else {
+									data += "Webcam)"
+								}
+								message += data + "\n"
+							}
+							message += "\n"
+						} else {
+							message = "Сейчас нет доступных камер. Вы можете выбрать готовую камеру /addpreset или создать новую с нуля /addcamera."
+						}
+
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 						currentState = StateWork
@@ -291,13 +400,27 @@ func main() {
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 					} else {
-						cam := getActive()
-						message := "Камера, с которой ведется трансляция:\n"
-						message += cam.Name + " ("
-						if cam.Type == 1 {
-							message += "RTSP)"
+						cam, err := getActive()
+						if err != nil {
+							message := "Сервер не отвечает, проверьте его состояние."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateWork
+							continue
+						}
+
+						message := ""
+
+						if cam.Name != "" {
+							message = "Камера, с которой ведется трансляция:\n"
+							message += cam.Name + " ("
+							if cam.Type == 1 || cam.Type == 2 {
+								message += "RTSP)"
+							} else {
+								message += "Webcam)"
+							}
 						} else {
-							message += "Webcam)"
+							message = "Сейчас ни одна камера не работает. Вы можете выбрать готовую камеру /addpreset или создать новую с нуля /addcamera."
 						}
 
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
@@ -311,23 +434,86 @@ func main() {
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
 					} else {
-						cameras = getCameras()
-						message := "Список доступных камер:\n"
-
-						for i := 0; i < len(cameras); i++ {
-							data := strconv.Itoa(i+1) + ") " + cameras[i].Name + " ("
-							if cameras[i].Type == 1 {
-								message += "RTSP)"
-							} else {
-								message += "Webcam)"
-							}
-							message += data + "\n"
+						var err error
+						cameras, err = getCameras()
+						if err != nil {
+							message := "Сервер не отвечает, проверьте его состояние."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateWork
+							continue
 						}
-						message += "Сделайте выбор, введя номер камеры в списке (например, 1 или 2). Для отмены введите /cancel."
+
+						message := ""
+
+						if len(cameras) != 0 {
+							message = "Список доступных камер:\n"
+
+							for i := 0; i < len(cameras); i++ {
+								data := strconv.Itoa(i+1) + ") " + cameras[i].Name + " ("
+								if cameras[i].Type == 1 || cameras[i].Type == 2 {
+									data += "RTSP)"
+								} else {
+									data += "Webcam)"
+								}
+								message += data + "\n"
+							}
+							message += "\n"
+							message += "Сделайте выбор, введя номер камеры в списке, например, 1 или 2. Для отмены введите /cancel."
+							currentState = StateSelectCamera
+						} else {
+							message = "Сейчас нет доступных камер. Вы можете выбрать готовую камеру /addpreset или создать новую с нуля /addcamera."
+							currentState = StateWork
+						}
 
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
-						currentState = StateSelectCamera
+					}
+
+				case "/addcamera":
+					if !isAwake {
+						message := "Важно - настройка камер невозможна при выключенной системе. Пожалуйста, выполните команду /awake для запуска.\n"
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+					} else {
+						newCamera.Name = ""
+						newCamera.Type = -1
+						newCamera.URL = ""
+
+						message := "Введите уникальное имя новой камеры:"
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateEnterName
+					}
+
+				case "/addpreset":
+					if !isAwake {
+						message := "Важно - настройка камер невозможна при выключенной системе. Пожалуйста, выполните команду /awake для запуска.\n"
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+					} else {
+						newCamera.Name = ""
+						newCamera.Type = -1
+						newCamera.URL = ""
+
+						message := "Список доступных пресетов:\n"
+
+						for i := 0; i < len(presets); i++ {
+							data := strconv.Itoa(i+1) + ") " + presets[i].Name + " ("
+							if presets[i].Type == 1 || presets[i].Type == 2 {
+								data += "RTSP)"
+							} else {
+								data += "Webcam)"
+							}
+							message += data + "\n"
+						}
+						message += "\n"
+						message += "Сделайте выбор, введя номер камеры в списке, например, 1 или 2. Для отмены введите /cancel."
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateSelectPreset
 					}
 				}
 
@@ -347,7 +533,7 @@ func main() {
 							continue
 						}
 
-						selectCamera(cameras[value].Name)
+						selectCamera(cameras[value-1].Name)
 						message := "Камера успешно выбрана."
 						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 						bot.Send(msg)
@@ -362,7 +548,33 @@ func main() {
 					bot.Send(msg)
 					currentState = StateWork
 				} else {
+					if value, err := strconv.ParseInt(update.Message.Text, 10, 64); err == nil {
+						if value < 1 || value > int64(len(presets)) {
+							message := "Простите, но камеры с таким номером не существует. Введите другой номер или /cancel."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateSelectPreset
+							continue
+						}
 
+						newCamera.Name = presets[value-1].Name
+						newCamera.Type = presets[value-1].Type
+						newCamera.URL = presets[value-1].URL
+
+						err := addCamera(newCamera)
+						if err != nil {
+							message := "Сервер не отвечает, проверьте его состояние."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateWork
+							continue
+						}
+
+						message := "Новая камера успешно создана. Вы можете ее увидеть в списке, введя команду /getcameras."
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateWork
+					}
 				}
 
 			case StateEnterName:
@@ -372,7 +584,24 @@ func main() {
 					bot.Send(msg)
 					currentState = StateWork
 				} else {
+					if !isNameUnique(update.Message.Text) {
+						message := "Данное имя камеры уже занято. Пожалуйста, введите другое имя."
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateEnterName
+						continue
+					}
 
+					newCamera.Name = update.Message.Text
+
+					message := "Введите число от 0 до 2, описывающее тип новой камеры:\n"
+					message += "0 - USB-камера, подключенная к серверу;\n"
+					message += "1 - RTSP-камера, использующая протокол TCP;\n"
+					message += "2 - RTSP-камера, использующая протокол UDP."
+
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+					bot.Send(msg)
+					currentState = StateEnterType
 				}
 
 			case StateEnterType:
@@ -382,7 +611,30 @@ func main() {
 					bot.Send(msg)
 					currentState = StateWork
 				} else {
+					if value, err := strconv.ParseInt(update.Message.Text, 10, 64); err == nil {
+						if value < 0 || value > 2 {
+							message := "Простите, но такого типа камер не существует. Введите другой тип или /cancel."
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+							bot.Send(msg)
+							currentState = StateEnterType
+							continue
+						}
 
+						newCamera.Type = int(value)
+
+						message := ""
+
+						if newCamera.Type == 0 {
+							message = "Введите номер video-устройства, подключенного к серверу:\n"
+						} else {
+							message = "Введите полную строку подключения к RTSP камере (зависит от ее производителя), например:\n"
+							message += "rtsp://192.168.1.2:554/user=admin_password=abcdef_channel=1_stream=0.sdp?real_stream"
+						}
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateEnterURL
+					}
 				}
 
 			case StateEnterURL:
@@ -392,9 +644,35 @@ func main() {
 					bot.Send(msg)
 					currentState = StateWork
 				} else {
+					if newCamera.Type == 0 {
+						if value, err := strconv.ParseInt(update.Message.Text, 10, 64); err == nil {
+							if value < 0 {
+								message := "Простите, но такого номера камер не существует. Введите другой номер или /cancel."
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+								bot.Send(msg)
+								currentState = StateEnterURL
+								continue
+							}
+							newCamera.URL = "/dev/video" + strconv.Itoa(int(value))
+						}
+					} else {
+						newCamera.URL = update.Message.Text
+					}
 
+					err := addCamera(newCamera)
+					if err != nil {
+						message := "Сервер не отвечает, проверьте его состояние."
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+						bot.Send(msg)
+						currentState = StateWork
+						continue
+					}
+
+					message := "Новая камера успешно создана. Вы можете ее увидеть в списке, введя команду /getcameras."
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
+					bot.Send(msg)
+					currentState = StateWork
 				}
-
 			}
 		}
 	}
