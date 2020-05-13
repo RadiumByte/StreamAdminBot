@@ -86,10 +86,12 @@ func awakeSystem() {
 		cmdRunServer := exec.Command("/home/anton/Radium/StreamServer/StreamServer")
 		cmdRunServer.Start()
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(3 * time.Second)
 
 		cmdRunChatbot := exec.Command("/home/anton/Radium/LabYoutubeChatbot/LabYoutubeChatbot")
 		cmdRunChatbot.Start()
+
+		time.Sleep(6 * time.Second)
 
 		isAwake = true
 	}
@@ -223,6 +225,23 @@ func getActive() (CameraData, error) {
 		Type: typeCam}, nil
 }
 
+func getStreamURL() string {
+	request.Header.SetMethod("GET")
+
+	url := "http://" + serverIP + serverPort + "/stream-url"
+
+	request.SetRequestURI(url)
+	err := client.Do(request, response)
+	log.Printf("Status code: %d\n", response.StatusCode())
+
+	if err != nil {
+		fmt.Println("Client: getStreamURL failed to make a request.")
+		return ""
+	}
+
+	return string(response.Body())
+}
+
 func addCamera(data AddCameraData) error {
 	request.Header.SetMethod("POST")
 	request.Header.SetContentType("application/json")
@@ -341,7 +360,8 @@ func main() {
 
 				case "/awake":
 					awakeSystem()
-					message := "Система запущена."
+					URL := getStreamURL()
+					message := "Система запущена. URL онлайн-трансляции: " + URL
 
 					msg := tgbotapi.NewMessage(update.Message.Chat.ID, message)
 					bot.Send(msg)
